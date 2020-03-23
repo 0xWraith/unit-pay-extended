@@ -1,5 +1,7 @@
 <?php
 
+require_once('UnitPayModel.php');
+
 class UnitPay
 {
     private $event;
@@ -12,31 +14,51 @@ class UnitPay
     public function getResult()
     {
         $request = $_GET;
+        $params = $request['params'];
 
-        if (empty($request['method'])
-            || empty($request['params'])
-            || !is_array($request['params'])
-        )
+        if(empty($request['method']) || empty($request['params']) || !is_array($request['params']))
         {
-            return $this->getResponseError('Invalid request');
+            return $this->getResponseError('Неудачный запрос: Отсутствуют параметры для оплаты!', null);
+        }
+
+        $server = -1;
+        preg_match_all("/\d+/", $params['account'], $matches);
+
+        $account = preg_replace('/\d/', '', $params['account']);
+
+        if(isset($matches[0])) 
+        {
+            foreach($matches[0] as $number) 
+            {
+                $server = (int)$number;
+                break;
+            }
+        }
+
+        if($server < 1 || $server > 4)
+        {
+            return $this->getResponseError('Неудачный запрос: Неверный номер сервера!', -1);
         }
 
         $method = $request['method'];
-        $params = $request['params'];
 
-        if ($params['signature'] != $this->getSha256SignatureByMethodAndParams($method, $params, Config::SECRET_KEY))
+        if($params['signature'] != $this->getSha256SignatureByMethodAndParams($method, $params, Config::SECRET_KEY))
         {
-            return $this->getResponseError('Incorrect digital signature');
+            return $this->getResponseError('Неверная цифровая подпись при совершении оплаты!', $server);
         }
-
         $unitPayModel = UnitPayModel::getInstance();
-
-        if ($method == 'check')
+        if($method == 'check')
         {
-            if ($unitPayModel->getPaymentByUnitpayId($params['unitpayId']))
+            $checkResult = $this->event->check($params);
+            if ($checkResult !== true)
+            {
+                return $this->getResponseError($checkResult, $server);
+            }
+
+            if ($unitPayModel->getPaymentByUnitpayId($params['unitpayId'], $server))
             {
                 // Платеж уже существует
-                return $this->getResponseSuccess('Payment already exists');
+                return $this->getResponseSuccess('Платёж уже существует в Базе Данных сервера!', $server);
             }
 
             $itemsCount = floor($params['sum'] / Config::ITEM_PRICE);
@@ -44,54 +66,40 @@ class UnitPay
             if ($itemsCount <= 0)
             {
                 return $this->getResponseError('Суммы ' . $params['sum'] . ' руб. не достаточно для оплаты товара ' .
-                    'стоимостью ' . Config::ITEM_PRICE . ' руб.');
+                    'стоимостью ' . Config::ITEM_PRICE . ' руб.', $server);
             }
 
-            if (!$unitPayModel->createPayment(
-                $params['unitpayId'],
-                $params['account'],
-                $params['sum'],
-                $itemsCount
-            ))
+            if (!$unitPayModel->createPayment($params['unitpayId'], $account, $params['sum'], $itemsCount, $server))
             {
-                return $this->getResponseError('Unable to create payment database');
+                return $this->getResponseError('Произошла ошибка при создании данных в Базе Данных!', $server);
             }
 
-            $checkResult = $this->event->check($params);
-            if ($checkResult !== true)
-            {
-                return $this->getResponseError($checkResult);
-            }
-
-            return $this->getResponseSuccess('CHECK is successful');
+            return $this->getResponseSuccess('Проверка прошла успешно!', $server);
         }
 
         if ($method == 'pay')
         {
-            $payment = $unitPayModel->getPaymentByUnitpayId(
-                $params['unitpayId']
-            );
+            $payment = $unitPayModel->getPaymentByUnitpayId($params['unitpayId'], $server);
 
             if ($payment && $payment->status == 1)
             {
-                return $this->getResponseSuccess('Payment has already been paid');
+                return $this->getResponseSuccess('Данный платёж был уже оплачен!', $server);
             }
 
-            if (!$unitPayModel->confirmPaymentByUnitpayId($params['unitpayId']))
+            if (!$unitPayModel->confirmPaymentByUnitpayId($params['unitpayId'], $server))
             {
-                return $this->getResponseError('Unable to confirm payment database');
+                return $this->getResponseError('Ошибка при подтверждении платежа!', $server);
             }
 
-            $this->event
-                ->pay($params);
+            $this->event->pay($params);
 
-            return $this->getResponseSuccess('PAY is successful');
+            return $this->getResponseSuccess('Платёж прошёл успешно!', $server);
         }
 
-	return $this->getResponseError($method.' not supported');
+	    return $this->getResponseError('Метод \"'.$method.'\" не поддерживается!', $server);
     }
 
-    private function getResponseSuccess($message)
+    private function getResponseSuccess($message, $server)
     {
         return json_encode(array(
             "jsonrpc" => "2.0",
@@ -99,10 +107,11 @@ class UnitPay
                 "message" => $message
             ),
             'id' => 1,
+            'server' => $server
         ));
     }
 
-    private function getResponseError($message)
+    private function getResponseError($message, $server)
     {
         return json_encode(array(
             "jsonrpc" => "2.0",
@@ -110,7 +119,8 @@ class UnitPay
                 "code" => -32000,
                 "message" => $message
             ),
-            'id' => 1
+            'id' => 1,
+            'server' => $server
         ));
     }
 
